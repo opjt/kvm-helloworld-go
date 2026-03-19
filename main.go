@@ -1,6 +1,7 @@
 package main
 
 import (
+	"fmt"
 	"log"
 	"os"
 	"syscall"
@@ -23,8 +24,9 @@ const (
 	KVM_GET_SREGS = 0x8138ae83 // 특수 레지스터 읽기
 	KVM_SET_SREGS = 0x4138ae84 // 특수 레지스터 쓰기
 
-	KVM_EXIT_UNKNOWN = 0 // 알 수 없는 VM-Exit
-	KVM_EXIT_HLT     = 5 // 게스트가 HLT 명령어 실행
+	KVM_EXIT_UNKNOWN = 0 // unknown VM-Exit
+	KVM_EXIT_IO      = 2 // guest executed IN/OUT instruction
+	KVM_EXIT_HLT     = 5 // guest executed HLT
 )
 
 // 게스트 물리메모리 슬롯 등록 구조체
@@ -40,10 +42,21 @@ type KvmUserspaceMemoryRegion struct {
 // KVM_RUN 후 커널이 채워주는 VM-Exit 정보
 // vcpu_fd를 mmap해서 공유메모리로 읽음
 type KvmRun struct {
-	RequestInterruptWindow uint8
-	ImmediateExit          uint8
-	Padding1               [6]uint8
-	ExitReason             uint32 // KVM_EXIT_HLT, KVM_EXIT_IO 등
+	RequestInterruptWindow     uint8    // offset 0
+	ImmediateExit              uint8    // offset 1
+	Padding1                   [6]uint8 // offset 2
+	ExitReason                 uint32   // offset 8
+	ReadyForInterruptInjection uint8    // offset 12
+	IfFlag                     uint8    // offset 13
+	Flags                      uint16   // offset 14
+	Cr8                        uint64   // offset 16
+	ApicBase                   uint64   // offset 24
+	// KVM_EXIT_IO fields (offset 32)
+	IoDirection  uint8  // 0=IN(host→guest), 1=OUT(guest→host)
+	IoSize       uint8  // byte=1, word=2, dword=4
+	IoPort       uint16 // port number
+	IoCount      uint32 // number of I/O operations
+	IoDataOffset uint64 // offset from start of kvm_run to data
 }
 
 // x86_64 일반 레지스터
@@ -121,10 +134,21 @@ func main() {
 	}
 	defer syscall.Munmap(mem)
 
-	// 4. Write HLT (0xF4) to address 0
-	// HLT : https://en.wikipedia.org/wiki/HLT_(x86_instruction)
-	// vCPU starts at CS=0, RIP=0 -> execute HLT -> VM-Exit
-	mem[0] = 0xF4
+	// 4. Write guest code to memory
+	// Output "Hello, KVM!" to serial port (0x3F8), then HLT
+	code := []byte{
+		// mov dx, 0x3F8 (serial port address)
+		0xBA, 0xF8, 0x03,
+	}
+	msg := "Hello, KVM!\n"
+	for _, ch := range []byte(msg) {
+		code = append(code,
+			0xB0, ch, // mov al, <char>
+			0xEE, // out dx, al
+		)
+	}
+	code = append(code, 0xF4) // hlt
+	copy(mem, code)
 
 	// 5. Register guest physical memory with KVM
 	region := KvmUserspaceMemoryRegion{
@@ -243,22 +267,30 @@ func main() {
 		log.Fatal("KVM_SET_REGS failed:", errno)
 	}
 
-	// 11. run vCPU
-	// VM-Exit 발생하면 ioctl 반환, kvmRun.ExitReason으로 원인 확인
-	_, _, errno = syscall.Syscall(
-		syscall.SYS_IOCTL,
-		vcpuFd,
-		uintptr(KVM_RUN),
-		uintptr(0),
-	)
-	if errno != 0 {
-		log.Fatal("KVM_RUN failed:", errno)
-	}
+	// 11. Run vCPU in a loop
+	// Each OUT instruction causes a VM-Exit, we read the byte and print it
+	for {
+		_, _, errno = syscall.Syscall(
+			syscall.SYS_IOCTL,
+			vcpuFd,
+			uintptr(KVM_RUN),
+			uintptr(0),
+		)
+		if errno != 0 {
+			log.Fatal("KVM_RUN failed:", errno)
+		}
 
-	switch kvmRun.ExitReason {
-	case KVM_EXIT_HLT:
-		log.Println("VM halted!")
-	default:
-		log.Printf("unexpected exit: %d\n", kvmRun.ExitReason)
+		switch kvmRun.ExitReason {
+		case KVM_EXIT_IO:
+			if kvmRun.IoDirection == 1 && kvmRun.IoPort == 0x3F8 {
+				ch := kvmRunMmap[kvmRun.IoDataOffset]
+				fmt.Print(string(ch))
+			}
+		case KVM_EXIT_HLT:
+			log.Println("VM halted!")
+			return
+		default:
+			log.Fatalf("unexpected exit: %d\n", kvmRun.ExitReason)
+		}
 	}
 }
