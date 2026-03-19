@@ -16,7 +16,7 @@ const (
 	KVM_SET_TSS_ADDR = 0xAE47 // KVM 내부 TSS 주소 설정 (필수)
 
 	KVM_GET_VCPU_MMAP_SIZE     = 0xAE04     // kvm_run 구조체 mmap 크기 조회
-	KVM_SET_USER_MEMORY_REGION = 0x4020AE46 // 게스트 물리메모리 등록
+	KVM_SET_USER_MEMORY_REGION = 0x4020AE46 // Register Guest Physical Memory
 
 	KVM_GET_REGS  = 0x8090ae81 // 일반 레지스터 읽기
 	KVM_SET_REGS  = 0x4090ae82 // 일반 레지스터 쓰기
@@ -91,7 +91,7 @@ type KvmSregs struct {
 }
 
 func main() {
-	// 1. /dev/kvm 열기
+	// 1. open /dev/kvm
 	kvmFile, err := os.OpenFile("/dev/kvm", os.O_RDWR, 0)
 	if err != nil {
 		log.Fatal(err)
@@ -99,8 +99,8 @@ func main() {
 	defer kvmFile.Close()
 	kvmFd := kvmFile.Fd()
 
-	// 2. VM 생성 → vm_fd 반환
-	r1, _, errno := syscall.Syscall(
+	// 2. Create vm
+	vmFd, _, errno := syscall.Syscall(
 		syscall.SYS_IOCTL,
 		kvmFd,
 		uintptr(KVM_CREATE_VM),
@@ -109,9 +109,8 @@ func main() {
 	if errno != 0 {
 		log.Fatal("KVM_CREATE_VM failed:", errno)
 	}
-	vmFd := r1
 
-	// 3. 게스트 물리메모리로 쓸 호스트 메모리 1MB 확보
+	// 3. Allocate 1MB of host memory for guest physical memory
 	mem, err := syscall.Mmap(
 		-1, 0, 1<<20,
 		syscall.PROT_READ|syscall.PROT_WRITE,
@@ -122,14 +121,15 @@ func main() {
 	}
 	defer syscall.Munmap(mem)
 
-	// 4. 0번지에 HLT(0xF4) 써넣기
-	// vCPU는 CS=0, RIP=0 에서 시작 → 여기서 HLT 실행 → VM-Exit
+	// 4. Write HLT (0xF4) to address 0
+	// HLT : https://en.wikipedia.org/wiki/HLT_(x86_instruction)
+	// vCPU starts at CS=0, RIP=0 -> execute HLT -> VM-Exit
 	mem[0] = 0xF4
 
-	// 5. KVM에 게스트 물리메모리 등록
+	// 5. Register guest physical memory with KVM
 	region := KvmUserspaceMemoryRegion{
 		Slot:          0,
-		Flags:         0,
+		Flags:         0, // (read/write)
 		GuestPhysAddr: 0,
 		MemorySize:    1 << 20,
 		UserspaceAddr: uint64(uintptr(unsafe.Pointer(&mem[0]))),
@@ -144,18 +144,18 @@ func main() {
 		log.Fatal("KVM_SET_USER_MEMORY_REGION failed:", errno)
 	}
 
-	// 6. KVM 내부 TSS 주소 설정 (in-kernel irqchip 사용 시 필수)
+	// 6. set TSS address
 	_, _, errno = syscall.Syscall(
 		syscall.SYS_IOCTL,
 		vmFd,
 		uintptr(KVM_SET_TSS_ADDR),
-		uintptr(0xfffbd000),
+		uintptr(0xfffbd000), // outside the guest memory
 	)
 	if errno != 0 {
 		log.Fatal("KVM_SET_TSS_ADDR failed:", errno)
 	}
 
-	// 7. vCPU 생성 → vcpu_fd 반환
+	// 7. create vCPU
 	vcpuFd, _, errno := syscall.Syscall(
 		syscall.SYS_IOCTL,
 		vmFd,
@@ -166,9 +166,9 @@ func main() {
 		log.Fatal("KVM_CREATE_VCPU failed:", errno)
 	}
 
-	// 8. kvm_run 구조체 크기 조회 후 vcpu_fd mmap
-	// KVM_RUN 후 커널이 이 공유메모리에 VM-Exit 정보를 써줌
-	r1, _, errno = syscall.Syscall(
+	// 8. Get kvm_run struct size
+	// after KVM_RUN, the kernel writes VM-Exit info to this shared memory
+	mmapSize, _, errno := syscall.Syscall(
 		syscall.SYS_IOCTL,
 		kvmFd,
 		uintptr(KVM_GET_VCPU_MMAP_SIZE),
@@ -177,20 +177,23 @@ func main() {
 	if errno != 0 {
 		log.Fatal("KVM_GET_VCPU_MMAP_SIZE failed:", errno)
 	}
-	vcpuMmap, err := syscall.Mmap(
-		int(vcpuFd), 0, int(r1),
+	kvmRunMmap, err := syscall.Mmap(
+		int(vcpuFd),
+		0,
+		int(mmapSize),
 		syscall.PROT_READ|syscall.PROT_WRITE,
 		syscall.MAP_SHARED,
 	)
 	if err != nil {
 		log.Fatal(err)
 	}
-	defer syscall.Munmap(vcpuMmap)
-	kvmRun := (*KvmRun)(unsafe.Pointer(&vcpuMmap[0]))
+	defer syscall.Munmap(kvmRunMmap)
 
-	// 9. 특수 레지스터 세팅
-	// CS.base=0, CS.selector=0, CR0 PE비트 끄기 → 리얼모드
-	var sregs KvmSregs
+	kvmRun := (*KvmRun)(unsafe.Pointer(&kvmRunMmap[0]))
+
+	// 9. Set special registers for real mode
+	// CS.base=0, CS.selector=0, clear CR0.bit -> real mode (16-bit)
+	var sregs KvmSregs // special registers
 	_, _, errno = syscall.Syscall(
 		syscall.SYS_IOCTL,
 		vcpuFd,
@@ -202,11 +205,11 @@ func main() {
 	}
 	sregs.Cs.Base = 0
 	sregs.Cs.Selector = 0
-	sregs.Cs.Limit = 0xFFFF
-	sregs.Cs.Present = 1
-	sregs.Cs.Type = 0xB                // execute/read, accessed
+	sregs.Cs.Limit = 0xFFFF            // 64KB
+	sregs.Cs.Present = 1               // valid segment
+	sregs.Cs.Type = 0xB                // Execute/Read, accessed (cpu manual Code-and Data-Segment Descriptor Types)
 	sregs.Cs.S = 1                     // code/data segment
-	sregs.Cr0 = sregs.Cr0 &^ uint64(1) // PE 비트 끄기 (리얼모드)
+	sregs.Cr0 = sregs.Cr0 &^ uint64(1) // PE bit off (real mode)
 	_, _, errno = syscall.Syscall(
 		syscall.SYS_IOCTL,
 		vcpuFd,
@@ -217,8 +220,7 @@ func main() {
 		log.Fatal("KVM_SET_SREGS failed:", errno)
 	}
 
-	// 10. 일반 레지스터 세팅
-	// RIP=0 → mem[0] 에서 실행 시작
+	// 10. Set general purpose registers
 	var regs KvmRegs
 	_, _, errno = syscall.Syscall(
 		syscall.SYS_IOCTL,
@@ -229,8 +231,8 @@ func main() {
 	if errno != 0 {
 		log.Fatal("KVM_GET_REGS failed:", errno)
 	}
-	regs.Rip = 0
-	regs.Rflags = 0x2 // bit 1은 항상 1이어야 함 (x86 스펙)
+	regs.Rip = 0      // cs:ip
+	regs.Rflags = 0x2 // Reserved, always 1 (x86 spec)
 	_, _, errno = syscall.Syscall(
 		syscall.SYS_IOCTL,
 		vcpuFd,
@@ -241,7 +243,7 @@ func main() {
 		log.Fatal("KVM_SET_REGS failed:", errno)
 	}
 
-	// 11. vCPU 실행
+	// 11. run vCPU
 	// VM-Exit 발생하면 ioctl 반환, kvmRun.ExitReason으로 원인 확인
 	_, _, errno = syscall.Syscall(
 		syscall.SYS_IOCTL,
